@@ -117,6 +117,10 @@ node test/stop-hook.mjs     # 6 checks of the Stop hook (no Worker needed)
 
 `npm run check` type-checks the code. Each `npm test` run ends with a 15-minute sign-in lock, so restart `npm run dev` before the next run.
 
+## Directory listing (Glama)
+
+Glama scores MCP servers by starting them in a container and listing their tools over stdio. The Worker can't run that way, so `worker/glama/stdio.mjs` answers `initialize` and `tools/list` with the same catalog the Worker serves (`worker/src/catalog.ts`). Its `tools/call` only points back to this README. `glama.json` tells Glama how to run it. Needs Node 22.18 or later, no install.
+
 ## How sign-in works
 
 The Worker is its own OAuth server, with dynamic client registration and PKCE. claude.ai registers itself and sends you to a sign-in page that asks for your passphrase. There is one owner and no user accounts.
