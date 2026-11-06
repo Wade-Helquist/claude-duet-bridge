@@ -8,7 +8,7 @@ model = "opus"
 timeout_secs = 1800                    # one read-mode job or turn may run this long
 work_timeout_secs = 3600               # one work-mode turn may run this long
 max_parallel = 2                       # how many sessions and jobs run at the same time
-poll_secs = 3                          # how often serve asks the Worker for work when idle
+poll_secs = 30                         # how often serve asks the Worker for work when idle (3 used most of the free daily Durable Objects reads)
 max_jobs_per_run = 3                   # only for `duet-bridge.py poll`: jobs taken per check
 
 # Read mode (the default). Tools a run may use. Everything else is refused (--permission-mode dontAsk).

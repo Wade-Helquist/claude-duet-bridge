@@ -14,9 +14,16 @@ const INSTRUCTIONS = `Duet Bridge connects you to Claude Code on the user's Mac.
 - open_on_mac shows a headless session in a terminal window on the Mac, so the user can take over by hand. end_session closes a session you no longer need.
 - Nothing Claude Code does sends email or messages for the user. It stages drafts for the user to review.
 - bridge_status shows when the Mac last checked in. If that is more than 2 minutes ago, the Mac is probably asleep or offline, so tell the user the work will wait.
-- send_job, get_job, list_jobs and cancel_job are the older one-shot path. Prefer sessions.`;
+- send_job, get_job, list_jobs and cancel_job are the older one-shot path. Prefer sessions.
+- Give each start_session, send_message and send_job call a new request_id. If you send the same call again after an error or a dropped connection, use the same request_id, so the Mac does not run the task twice.`;
 
 const STATUSES = ["queued", "running", "done", "failed", "cancelled"];
+
+const REQUEST_ID =
+  "Optional. A new random id for this call. If you send the same call again, use the same request_id: the bridge returns the first result and does not queue the task twice.";
+
+// The repeat guard's key, from Duet's optional request_id.
+const rid = (args: Record<string, unknown>) => str(args, "request_id", false).slice(0, 100);
 
 function tools(workspaces: string[]) {
   return [
@@ -31,6 +38,7 @@ function tools(workspaces: string[]) {
           title: { type: "string", description: "A short name for the job, for example 'Summarize this week's meeting notes'." },
           instructions: { type: "string", description: "The full brief: what to find or draft, and what the answer should look like." },
           workspace: { type: "string", enum: workspaces, default: workspaces[0], description: "Which project folder on the Mac the job runs in." },
+          request_id: { type: "string", maxLength: 100, description: REQUEST_ID },
         },
         required: ["title", "instructions"],
         additionalProperties: false,
@@ -142,6 +150,7 @@ function tools(workspaces: string[]) {
             description: "read: look things up and answer in text. work: may also edit files and run commands, with the user's own Claude Code safety rules on. Use work only when the user asked for changes.",
           },
           wait_seconds: { type: "integer", minimum: 0, maximum: 45, default: 0, description: "Hold the call this long for the first answer." },
+          request_id: { type: "string", maxLength: 100, description: REQUEST_ID },
         },
         required: ["name", "message"],
         additionalProperties: false,
@@ -159,6 +168,7 @@ function tools(workspaces: string[]) {
           session_id: { type: "string", description: "The id from list_sessions or start_session." },
           text: { type: "string", description: "The message." },
           wait_seconds: { type: "integer", minimum: 0, maximum: 45, default: 0 },
+          request_id: { type: "string", maxLength: 100, description: REQUEST_ID },
         },
         required: ["session_id", "text"],
         additionalProperties: false,
@@ -254,9 +264,9 @@ async function callTool(env: Env, name: string, args: Record<string, unknown>) {
     case "send_job": {
       const workspace = str(args, "workspace", false) || workspaces[0];
       if (!workspaces.includes(workspace)) throw new ToolError(`Unknown workspace '${workspace}'. Use one of: ${workspaces.join(", ")}.`);
-      const job = await box.addJob(str(args, "title"), str(args, "instructions"), workspace);
+      const job = await box.addJob(str(args, "title"), str(args, "instructions"), workspace, rid(args));
       const status = await box.status();
-      return text({ id: job.id, status: job.status, workspace, last_mac_checkin: status.last_mac_checkin });
+      return text({ id: job.id, status: job.status, workspace, repeat: job.repeat, last_mac_checkin: status.last_mac_checkin });
     }
     case "get_job": {
       const job = await box.getJob(str(args, "id"));
@@ -295,9 +305,9 @@ async function callTool(env: Env, name: string, args: Record<string, unknown>) {
       const mode = str(args, "mode", false) || "read";
       if (mode !== "read" && mode !== "work") throw new ToolError("'mode' must be read or work.");
       const ms = wait(args);
-      const { session } = await box.startHeadless(str(args, "name"), workspace, mode, str(args, "message"));
+      const { session, repeat } = await box.startHeadless(str(args, "name"), workspace, mode, str(args, "message"), rid(args));
       const replies = ms ? await box.waitForDuet(session.id, ms, true, 20) : [];
-      return text({ session: view(session), replies, note: replies.length ? undefined : "The Mac will answer in its next turn. Call read_messages with this session_id." });
+      return text({ session: view(session), repeat, replies, note: replies.length ? undefined : "The Mac will answer in its next turn. Call read_messages with this session_id." });
     }
     case "send_message": {
       const id = str(args, "session_id");
@@ -305,13 +315,13 @@ async function callTool(env: Env, name: string, args: Record<string, unknown>) {
       if (!s) throw new ToolError("No session has that id. Call list_sessions.");
       if (s.status === "ended") throw new ToolError("That session has ended. Start a new one with start_session.");
       const ms = wait(args);
-      const m = await box.sendToCode(id, str(args, "text"));
+      const m = await box.sendToCode(id, str(args, "text"), rid(args));
       const replies = ms ? await box.waitForDuet(id, ms, true, 20) : [];
       const live = s.kind === "live" ? (await box.listSessions(false, 50)).find((r) => r.id === id)?.connected : null;
       const note = replies.length ? undefined
         : live === false ? "The window is not connected right now. It gets the message when it reconnects."
         : "No answer yet. Call read_messages with this session_id.";
-      return text({ sent: m.id, replies, note });
+      return text({ sent: m.id, repeat: m.repeat, replies, note });
     }
     case "read_messages": {
       const id = str(args, "session_id", false) || null;

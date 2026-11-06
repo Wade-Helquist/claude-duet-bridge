@@ -110,7 +110,7 @@ cd worker
 npm install
 printf 'OWNER_PASSPHRASE=dev-only-passphrase\nBRIDGE_TOKEN=dev-only-bridge-token\nPUBLIC_URL=https://localhost:8787\n' > .dev.vars
 npm run dev                 # terminal 1: local Worker on https://localhost:8787, fresh store
-npm test                    # terminal 2: 54 checks of sign-in, tools, sessions and the live line
+npm test                    # terminal 2: 59 checks of sign-in, tools, sessions, the repeat guard and the live line
 node test/channel.mjs       # 13 checks of the channel, played as Claude Code (fresh store)
 node test/stop-hook.mjs     # 6 checks of the Stop hook (no Worker needed)
 ```

@@ -349,7 +349,7 @@ def cmd_serve(_args) -> int:
         while True:
             time.sleep(300)
     width = int(CFG.get("max_parallel", 2))
-    pause = float(CFG.get("poll_secs", 3))
+    pause = float(CFG.get("poll_secs", 30))
     pool = ThreadPoolExecutor(max_workers=width)
     running: set = set()
     log(f"serve: started (up to {width} at a time, every {pause:g}s)")

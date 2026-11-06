@@ -280,6 +280,29 @@ for (const brief of (process.env.LEAVE_JOBS ?? "").split("||").filter(Boolean)) 
   console.log(`  left job ${left.data.id}: ${brief.slice(0, 60)}`);
 }
 
+// ---- repeat guard: the same request_id after a reconnect never queues the task twice ----
+const rq = `rq-${Date.now()}`;
+const j1 = await tool("send_job", { title: "Repeat test", instructions: "Never runs.", request_id: rq });
+const j2 = await tool("send_job", { title: "Repeat test", instructions: "Never runs.", request_id: rq });
+check("a repeated send_job returns the first job", j1.data?.id && j2.data?.id === j1.data.id && j2.data?.repeat === true && !j1.data?.repeat,
+  JSON.stringify([j1.data, j2.data]));
+await tool("cancel_job", { id: j1.data?.id });
+const s1 = await tool("start_session", { name: "Repeat test", message: "Once only.", request_id: rq });
+const s2 = await tool("start_session", { name: "Repeat test", message: "Once only.", request_id: rq });
+const rsid = s1.data?.session?.id;
+check("a repeated start_session returns the first session", rsid && s2.data?.session?.id === rsid && s2.data?.repeat === true,
+  JSON.stringify([s1.data, s2.data]));
+const m1 = await tool("send_message", { session_id: rsid, text: "Twice?", request_id: rq });
+const m2 = await tool("send_message", { session_id: rsid, text: "Twice?", request_id: rq });
+const m3 = await tool("send_message", { session_id: rsid, text: "Twice?", request_id: `${rq}-b` });
+check("a repeated send_message is queued once", m1.data?.sent && m2.data?.sent === m1.data.sent && m2.data?.repeat === true,
+  JSON.stringify([m1.data, m2.data]));
+check("a new request_id is a new message", m3.data?.sent && m3.data.sent !== m1.data?.sent, JSON.stringify(m3.data));
+const rlist = await tool("list_sessions");
+const rrow = Array.isArray(rlist.data) ? rlist.data.find((s) => s.id === rsid) : null;
+check("the Mac has 3 messages waiting, not 5", rrow?.waiting_for_code === 3, JSON.stringify(rrow));
+await tool("end_session", { session_id: rsid });
+
 // ---- lockout (skipped when leaving jobs, so the store stays usable for another run) ----
 if (!process.env.LEAVE_JOBS) {
   for (let i = 0; i < 5; i++) await post({ handle: "x", decision: "approve", passphrase: "wrong" });

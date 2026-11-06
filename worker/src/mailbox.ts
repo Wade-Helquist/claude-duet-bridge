@@ -77,6 +77,9 @@ const LIVE_GONE_MS = 12 * 60 * 60 * 1000;
 // Sign-in lockout: this many wrong passphrases inside the window locks sign-in.
 const AUTH_FAIL_LIMIT = 5;
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
+// Finished jobs, read reports and messages, taken commands and ended sessions are kept this long.
+const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+const PRUNE_EVERY_MS = 60 * 60 * 1000;
 
 const now = () => new Date().toISOString();
 const clip = (s: string) => (s.length > MAX_TEXT ? s.slice(0, MAX_TEXT) + "\n[truncated]" : s);
@@ -118,12 +121,57 @@ export class Mailbox extends DurableObject {
         created_at TEXT NOT NULL, taken_at TEXT);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS auth_fail (at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status, created_at);
+      CREATE INDEX IF NOT EXISTS sessions_status ON sessions (status, kind);
+      CREATE INDEX IF NOT EXISTS commands_open ON commands (taken_at, created_at);
+      CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, result_id TEXT NOT NULL, created_at TEXT NOT NULL);
     `);
+  }
+
+  // The Mac asks for work every poll_secs. Without the indexes above and this trim, every ask read every old row
+  // (2026-11-05: 90% of the free 5M rows_read a day). Finished rows older than KEEP_MS go; open or unread rows stay.
+  private lastPrune = 0;
+  private prune(): void {
+    if (Date.now() - this.lastPrune < PRUNE_EVERY_MS) return;
+    this.lastPrune = Date.now();
+    const cutoff = new Date(Date.now() - KEEP_MS).toISOString();
+    this.sql.exec("DELETE FROM jobs WHERE status IN ('done','failed','cancelled') AND created_at < ?", cutoff);
+    this.sql.exec("DELETE FROM reports WHERE read_at IS NOT NULL AND created_at < ?", cutoff);
+    this.sql.exec(
+      `DELETE FROM messages WHERE created_at < ? AND
+       ((dir='to_code' AND taken_at IS NOT NULL) OR (dir='to_duet' AND read_at IS NOT NULL))`, cutoff);
+    this.sql.exec("DELETE FROM commands WHERE taken_at IS NOT NULL AND created_at < ?", cutoff);
+    this.sql.exec("DELETE FROM requests WHERE created_at < ?", cutoff);
+    this.sql.exec(
+      `DELETE FROM sessions WHERE status='ended' AND last_seen < ?
+       AND id NOT IN (SELECT session_id FROM messages WHERE session_id IS NOT NULL)`, cutoff);
+  }
+
+  // ---- repeat guard ----
+
+  // Duet may send the same call again after a dropped connection. A repeated request_id gets the first result
+  // back, so the Mac never runs the same task twice. Each check and insert is one synchronous step, so no race.
+  private earlier(key: string | null): string | null {
+    if (!key) return null;
+    const r = this.sql.exec("SELECT result_id FROM requests WHERE id=?", key).toArray()[0];
+    return r ? String(r.result_id) : null;
+  }
+
+  private remember(key: string | null, resultId: string): void {
+    if (key) this.sql.exec("INSERT OR REPLACE INTO requests (id,result_id,created_at) VALUES (?,?,?)", key, resultId, now());
+  }
+
+  getMessage(id: string): Message | null {
+    return (this.sql.exec("SELECT * FROM messages WHERE id = ?", id).toArray()[0] as unknown as Message) ?? null;
   }
 
   // ---- jobs ----
 
-  addJob(title: string, instructions: string, workspace: string): Job {
+  addJob(title: string, instructions: string, workspace: string, requestId = ""): Job & { repeat?: true } {
+    const key = requestId ? `job:${requestId}` : null;
+    const prior = this.earlier(key);
+    const old = prior ? this.getJob(prior) : null;
+    if (old) return { ...old, repeat: true };
     const job: Job = {
       id: newId("job"), title: clip(title).slice(0, 200), instructions: clip(instructions),
       workspace, status: "queued", created_at: now(), started_at: null, finished_at: null, result: null,
@@ -132,6 +180,7 @@ export class Mailbox extends DurableObject {
       "INSERT INTO jobs (id,title,instructions,workspace,status,created_at) VALUES (?,?,?,?,?,?)",
       job.id, job.title, job.instructions, job.workspace, job.status, job.created_at,
     );
+    this.remember(key, job.id);
     return job;
   }
 
@@ -230,13 +279,23 @@ export class Mailbox extends DurableObject {
     return s;
   }
 
-  startHeadless(name: string, workspace: string, mode: SessionMode, firstMessage: string): { session: Session; message: Message } {
+  startHeadless(name: string, workspace: string, mode: SessionMode, firstMessage: string, requestId = ""):
+    { session: Session; message: Message; repeat?: true } {
+    const key = requestId ? `ses:${requestId}` : null;
+    const prior = this.earlier(key);
+    const old = prior ? this.getSession(prior) : null;
+    if (old) {
+      const first = this.sql.exec(
+        "SELECT * FROM messages WHERE session_id=? AND dir='to_code' ORDER BY created_at LIMIT 1", old.id).toArray()[0] as unknown as Message;
+      return { session: old, message: first, repeat: true };
+    }
     const s: Session = {
       id: newId("ses"), kind: "headless", name: name.slice(0, 80) || "Duet session", workspace,
       mode, focus: "", status: "open", claude_id: crypto.randomUUID(), turns: 0,
       created_at: now(), last_seen: now(), busy_since: null,
     };
     this.insertSession(s);
+    this.remember(key, s.id);
     return { session: s, message: this.sendToCode(s.id, firstMessage) };
   }
 
@@ -286,8 +345,13 @@ export class Mailbox extends DurableObject {
 
   // ---- messages ----
 
-  sendToCode(sessionId: string, body: string): Message {
+  sendToCode(sessionId: string, body: string, requestId = ""): Message & { repeat?: true } {
+    const key = requestId ? `msg:${sessionId}:${requestId}` : null;
+    const prior = this.earlier(key);
+    const old = prior ? this.getMessage(prior) : null;
+    if (old) return { ...old, repeat: true };
     const m = this.insertMessage(sessionId, "to_code", body);
+    this.remember(key, m.id);
     this.sql.exec("UPDATE sessions SET last_seen=? WHERE id=?", now(), sessionId);
     this.pushToWindow(sessionId);
     return m;
@@ -343,6 +407,7 @@ export class Mailbox extends DurableObject {
   // The oldest session with unanswered messages that is not already running. One statement, so no double claim.
   claimTurn(host: string): { session: Session; messages: Message[] } | null {
     this.checkIn(host);
+    this.prune();
     this.expireBusy();
     const row = this.sql.exec(
       `UPDATE sessions SET status='busy', busy_since=?, last_seen=?
